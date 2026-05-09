@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>국한문혼용체 스마트 입력기</title>
+    <style>
+        :root { --primary: #3b71ca; --bg: #f4f6f9; --border: #cbd5e0; }
+        body { font-family: 'Malgun Gothic', sans-serif; background-color: var(--bg); padding: 20px; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+        h2 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid var(--primary); padding-bottom: 10px; }
+        
+        /* 비밀 메뉴 전용 스타일 (기본 숨김) */
+        #debug-panel { display: none; padding: 12px; border-radius: 8px; margin-bottom: 15px; font-size: 14px; background: #fff5f5; border: 1px solid #feb2b2; }
+        
+        .instructions { background: #f8f9fa; padding: 15px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; line-height: 1.6; border-left: 4px solid var(--primary); }
+        .instructions a { color: var(--primary); text-decoration: none; font-weight: bold; }
+        .instructions a:hover { text-decoration: underline; }
+        
+        textarea { width: 100%; height: 350px; font-size: 18px; padding: 15px; box-sizing: border-box; border: 2px solid var(--border); border-radius: 8px; resize: vertical; line-height: 1.6; outline: none; transition: border 0.2s; }
+        textarea:focus { border-color: var(--primary); }
+        textarea:disabled { background: #edf2f7; cursor: not-allowed; }
+
+        /* 플로팅 IME UI */
+        #floating-ime { position: absolute; display: none; background: white; border: 1px solid #94a3b8; border-radius: 6px; box-shadow: 0 6px 16px rgba(0,0,0,0.15); padding: 6px; z-index: 1000; min-width: 170px; }
+        .buffer-header { display: flex; justify-content: space-between; align-items: center; padding: 4px 6px 8px 6px; margin-bottom: 6px; border-bottom: 1px dashed #cbd5e0; }
+        .buffer-header .text { font-size: 14px; font-weight: bold; color: var(--primary); background: #ebf5ff; padding: 2px 6px; border-radius: 4px; }
+        .buffer-header .page-info { font-size: 12px; color: #64748b; font-weight: bold; background: #f1f5f9; padding: 2px 6px; border-radius: 12px; }
+        
+        .candidate-list { display: flex; flex-direction: column; gap: 2px; }
+        .candidate { padding: 8px 10px; border-radius: 4px; font-size: 18px; cursor: pointer; display: flex; align-items: center; }
+        .candidate.active { background: var(--primary); color: white; }
+        .candidate .num { font-size: 13px; color: #94a3b8; margin-right: 12px; min-width: 12px; text-align: center; }
+        .candidate.active .num { color: #dbeafe; }
+        
+        .help-text { font-size: 11px; color: #94a3b8; text-align: center; margin-top: 6px; padding-top: 6px; border-top: 1px solid #f1f5f9; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>국한문혼용체 스마트 입력기</h2>
+    
+    <!-- 디버그 패널 (비밀 메뉴로 활성화) -->
+    <div id="debug-panel">
+        <strong>🛠️ 디버그 모드:</strong> 
+        <input type="file" id="file-input" accept=".yaml,.txt,.dict">
+        <div id="debug-info" style="margin-top: 5px; font-family: monospace; font-size: 12px;"></div>
+    </div>
+
+    <div class="instructions">
+        <strong>💡 조작 방법:</strong><br>
+        1. <strong>한글 타자</strong>: 단어를 치면 후보가 나타나고, <strong>띄어쓰기</strong>를 하면 일반 한글로 남습니다.<br>
+        2. <strong>페이지 넘김</strong>: <code>◀ 좌/우 방향키 ▶</code> 또는 <code>PageUp/PageDown</code><br>
+        3. <strong>후보 선택</strong>: <code>▲ 상/하 방향키 ▼</code> 후 <code>Enter</code>, 또는 숫자키 <code>1~9</code><br>
+        <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 10px 0;">
+        📌 사전 출처: <a href="https://gall.dcinside.com/mgallery/board/view/?id=hanjahanmun&no=21494" target="_blank">ICFYSJ</a>
+    </div>
+
+    <textarea id="editor" placeholder="사전(dict.yaml)을 불러오는 중입니다..." disabled></textarea>
+
+    <!-- 플로팅 IME 후보창 -->
+    <div id="floating-ime">
+        <div id="ime-buffer" class="buffer-header"></div>
+        <div id="ime-candidates" class="candidate-list"></div>
+        <div class="help-text" id="ime-help">◀ ▶ 화살표로 페이지 이동</div>
+    </div>
+</div>
+
+<script>
+/** 
+ * [비밀 메뉴 안내]
+ * 브라우저 콘솔(F12)에서 ime.debug() 를 입력하면 
+ * 수동 파일 업로드 및 데이터 통계를 확인할 수 있습니다.
+ */
+
+// --- [1] 데이터 및 상태 변수 ---
+let dict = {};
+let activeMatch = null; 
+const PAGE_SIZE = 9;
+
+const editor = document.getElementById('editor');
+const fileInput = document.getElementById('file-input');
+const debugPanel = document.getElementById('debug-panel');
+const debugInfo = document.getElementById('debug-info');
+const floatingIme = document.getElementById('floating-ime');
+const imeBuffer = document.getElementById('ime-buffer');
+const imeCandidates = document.getElementById('ime-candidates');
+const imeHelp = document.getElementById('ime-help');
+
+// --- [2] 한글 -> 영문 두벌식 역변환 ---
+const CHO =['r','R','s','e','E','f','a','q','Q','t','T','d','w','W','c','z','x','v','g'];
+const JUNG =['k','o','i','O','j','p','u','P','h','hk','ho','hl','y','n','nj','np','nl','b','m','ml','l'];
+const JONG =['','r','R','rt','s','sw','sg','e','f','fr','fa','fq','ft','fx','fv','fg','a','q','qt','t','T','d','w','c','z','x','v','g'];
+const JAMO_MAP = {'ㄱ':'r','ㄲ':'R','ㄳ':'rt','ㄴ':'s','ㄵ':'sw','ㄶ':'sg','ㄷ':'e','ㄸ':'E','ㄹ':'f','ㄺ':'fr','ㄻ':'fa','ㄼ':'fq','ㄽ':'ft','ㄾ':'fx','ㄿ':'fv','ㅀ':'fg','ㅁ':'a','ㅂ':'q','ㅃ':'Q','ㅄ':'qt','ㅅ':'t','ㅆ':'T','ㅇ':'d','ㅈ':'w','ㅉ':'W','ㅊ':'c','ㅋ':'z','ㅌ':'x','ㅍ':'v','ㅎ':'g','ㅏ':'k','ㅐ':'o','ㅑ':'i','ㅒ':'O','ㅓ':'j','ㅔ':'p','ㅕ':'u','ㅖ':'P','ㅗ':'h','ㅘ':'hk','ㅙ':'ho','ㅚ':'hl','ㅛ':'y','ㅜ':'n','ㅝ':'nj','ㅞ':'np','ㅟ':'nl','ㅠ':'b','ㅡ':'m','ㅢ':'ml','ㅣ':'l'};
+
+function charToQwerty(char) {
+    if (JAMO_MAP[char]) return JAMO_MAP[char];
+    const code = char.charCodeAt(0) - 0xAC00;
+    if (code < 0 || code > 11171) return char;
+    const jong = code % 28;
+    const jung = Math.floor((code - jong) / 28) % 21;
+    const cho = Math.floor((code - jong) / 28 / 21);
+    return CHO[cho] + JUNG[jung] + JONG[jong];
+}
+function stringToQwerty(str) { return str.split('').map(charToQwerty).join(''); }
+
+// --- [3] 사전 파싱 ---
+function parseDictionary(text) {
+    dict = {};
+    const lines = text.split('\n');
+    let isDataSection = false;
+    let count = 0;
+
+    lines.forEach(line => {
+        line = line.trim();
+        if (!line || line.startsWith('#')) return;
+        if (line === '...') { isDataSection = true; return; }
+        if (!isDataSection && (line.startsWith('---') || line.includes(':'))) return;
+
+        const parts = line.split('\t');
+        if (parts.length >= 2) {
+            const word = parts[0].trim();
+            const normalizedKey = parts[1].trim().replace(/[^a-zA-Z]/g, '').toLowerCase(); 
+            let weight = parts.length >= 3 ? parseInt(parts[2].trim(), 10) : 0;
+            if (isNaN(weight)) weight = 0;
+
+            if (!dict[normalizedKey]) dict[normalizedKey] = [];
+            if (!dict[normalizedKey].find(item => item.word === word)) {
+                dict[normalizedKey].push({ word, weight });
+                count++;
+            }
+        }
+    });
+
+    for (let key in dict) {
+        dict[key].sort((a, b) => b.weight - a.weight);
+        dict[key] = dict[key].map(item => item.word);
+    }
+
+    editor.disabled = false;
+    editor.placeholder = "이곳에 한글을 자유롭게 타이핑하세요.";
+    debugInfo.textContent = `로드 성공: 총 ${count}개의 단어 조합이 준비되었습니다.`;
+    console.log(`%c [IME] 사전 로드 완료 (${count} items) `, "background: #3b71ca; color: white; padding: 2px 5px; border-radius: 3px;");
+}
+
+// 자동 로드 실행
+fetch('dict.yaml')
+    .then(r => { if (!r.ok) throw new Error(); return r.text(); })
+    .then(parseDictionary)
+    .catch(() => {
+        editor.placeholder = "사전(dict.yaml)을 찾을 수 없습니다. 디버그 메뉴를 확인하세요.";
+        console.warn("[IME] dict.yaml 자동 로드 실패. 서버 환경 혹은 파일명을 확인하세요.");
+    });
+
+// 비밀 디버그 메뉴 정의
+window.ime = {
+    debug: function() {
+        debugPanel.style.display = 'block';
+        console.log("%c [IME Debug] 수동 파일 선택 모드 활성화됨 ", "color: #e53e3e; font-weight: bold;");
+        return "디버그 패널이 활성화되었습니다.";
+    }
+};
+
+fileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = e => parseDictionary(e.target.result);
+    reader.readAsText(file);
+});
+
+// --- [4] UI 좌표 및 렌더링 ---
+function getCaretCoordinates() {
+    const div = document.createElement('div');
+    const style = window.getComputedStyle(editor);
+    for (const prop of style) div.style[prop] = style.getPropertyValue(prop);
+    div.style.position = 'absolute'; div.style.visibility = 'hidden';
+    div.style.whiteSpace = 'pre-wrap'; div.style.wordWrap = 'break-word';
+
+    const text = editor.value.substring(0, editor.selectionEnd);
+    div.textContent = text;
+    const span = document.createElement('span');
+    span.textContent = '.';
+    div.appendChild(span);
+    document.body.appendChild(div);
+
+    const rect = editor.getBoundingClientRect();
+    const top = rect.top + window.scrollY + span.offsetTop - editor.scrollTop + parseInt(style.lineHeight || 20);
+    const left = rect.left + window.scrollX + span.offsetLeft - editor.scrollLeft;
+    document.body.removeChild(div);
+    return { top, left };
+}
+
+function updateUI() {
+    if (!activeMatch || activeMatch.candidates.length === 0) {
+        floatingIme.style.display = 'none';
+        return;
+    }
+    
+    const totalPages = Math.ceil(activeMatch.candidates.length / PAGE_SIZE);
+    if (activeMatch.page >= totalPages) activeMatch.page = totalPages - 1;
+    
+    const startIdx = activeMatch.page * PAGE_SIZE;
+    const currentCandidates = activeMatch.candidates.slice(startIdx, startIdx + PAGE_SIZE);
+
+    let headerHTML = `<span class="text">${activeMatch.text} ▾</span>`;
+    if (totalPages > 1) {
+        headerHTML += `<span class="page-info">${activeMatch.page + 1} / ${totalPages}</span>`;
+        imeHelp.style.display = 'block';
+    } else {
+        imeHelp.style.display = 'none';
+    }
+    imeBuffer.innerHTML = headerHTML;
+    
+    imeCandidates.innerHTML = '';
+    currentCandidates.forEach((c, i) => {
+        let div = document.createElement('div');
+        div.className = 'candidate' + (i === activeMatch.index ? ' active' : '');
+        div.innerHTML = `<span class="num">${i + 1}</span>${c}`;
+        div.onmousedown = (e) => { e.preventDefault(); commitCandidate(i); };
+        imeCandidates.appendChild(div);
+    });
+
+    const coords = getCaretCoordinates();
+    floatingIme.style.top = coords.top + 'px';
+    floatingIme.style.left = coords.left + 'px';
+    floatingIme.style.display = 'block';
+}
+
+function commitCandidate(localIndex) {
+    if (!activeMatch) return;
+    const globalIndex = activeMatch.page * PAGE_SIZE + localIndex;
+    const chosenWord = activeMatch.candidates[globalIndex];
+    
+    const end = editor.selectionEnd;
+    const start = end - activeMatch.text.length;
+    
+    editor.value = editor.value.substring(0, start) + chosenWord + editor.value.substring(end);
+    editor.selectionStart = editor.selectionEnd = start + chosenWord.length;
+    
+    activeMatch = null;
+    updateUI();
+    editor.focus();
+}
+
+function checkMatch() {
+    const textBeforeCursor = editor.value.substring(0, editor.selectionEnd);
+    const lastSegment = textBeforeCursor.split(/[\s,.\?!;:'"()\[\]<>]/).pop();
+
+    if (!lastSegment || lastSegment.length === 0) {
+        activeMatch = null;
+        updateUI();
+        return;
+    }
+
+    let found = null;
+    const checkLength = Math.min(lastSegment.length, 15);
+    const checkString = lastSegment.slice(-checkLength);
+
+    for (let i = 0; i < checkString.length; i++) {
+        const suffix = checkString.substring(i);
+        const qwertyKey = stringToQwerty(suffix).replace(/[^a-zA-Z]/g, '').toLowerCase();
+        
+        if (dict[qwertyKey]) {
+            found = { text: suffix, key: qwertyKey, candidates: dict[qwertyKey], page: 0, index: 0 };
+            break; 
+        }
+    }
+
+    activeMatch = found;
+    updateUI();
+}
+
+// --- [5] 이벤트 리스너 ---
+editor.addEventListener('input', checkMatch);
+editor.addEventListener('keyup', (e) => {
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && !floatingIme.style.display) {
+        checkMatch();
+    }
+});
+
+editor.addEventListener('keydown', (e) => {
+    if (activeMatch && floatingIme.style.display === 'block') {
+        const totalPages = Math.ceil(activeMatch.candidates.length / PAGE_SIZE);
+        const currentCandidatesCount = Math.min(PAGE_SIZE, activeMatch.candidates.length - activeMatch.page * PAGE_SIZE);
+
+        if (/^[1-9]$/.test(e.key) && !e.ctrlKey && !e.altKey) {
+            let idx = parseInt(e.key) - 1;
+            if (idx < currentCandidatesCount) {
+                commitCandidate(idx);
+                e.preventDefault();
+            }
+            return;
+        }
+
+        if (e.key === 'ArrowDown') {
+            activeMatch.index = (activeMatch.index + 1) % currentCandidatesCount;
+            updateUI(); e.preventDefault(); return;
+        }
+        if (e.key === 'ArrowUp') {
+            activeMatch.index = (activeMatch.index - 1 + currentCandidatesCount) % currentCandidatesCount;
+            updateUI(); e.preventDefault(); return;
+        }
+        if (e.key === 'ArrowRight' || e.key === 'PageDown') {
+            if (totalPages > 1) {
+                activeMatch.page = (activeMatch.page + 1) % totalPages;
+                activeMatch.index = 0;
+                updateUI(); e.preventDefault();
+            }
+            return;
+        }
+        if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+            if (totalPages > 1) {
+                activeMatch.page = (activeMatch.page - 1 + totalPages) % totalPages;
+                activeMatch.index = 0;
+                updateUI(); e.preventDefault();
+            }
+            return;
+        }
+        if (e.key === 'Enter') {
+            commitCandidate(activeMatch.index);
+            e.preventDefault(); return;
+        }
+        if (e.key === 'Escape') {
+            activeMatch = null;
+            updateUI(); e.preventDefault(); return;
+        }
+    }
+});
+</script>
+
+</body>
+</html>
